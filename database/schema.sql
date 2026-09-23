@@ -1,30 +1,3 @@
--- ==================================================================
--- MEDAI · PostgreSQL schema (v1)
--- Health data is sensitive: enable pgcrypto, encrypt at rest,
--- and restrict direct table access behind the API service role.
--- ==================================================================
-
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
--- ---------- Identity & access ----------
-CREATE TABLE roles (
-    id          SERIAL PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,            -- super_admin | admin | medical_content_manager | support | analyst | user
-    description TEXT DEFAULT ''
-);
-
-CREATE TABLE permissions (
-    id          SERIAL PRIMARY KEY,
-    code        TEXT NOT NULL UNIQUE,            -- e.g. users.suspend, knowledge.reindex
-    description TEXT DEFAULT ''
-);
-
-CREATE TABLE role_permissions (
-    role_id       INT REFERENCES roles(id) ON DELETE CASCADE,
-    permission_id INT REFERENCES permissions(id) ON DELETE CASCADE,
-    PRIMARY KEY (role_id, permission_id)
-);
-
 CREATE TABLE users (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email           CITEXT NOT NULL UNIQUE,
@@ -184,3 +157,90 @@ INSERT INTO roles (name, description) VALUES
     ('support', 'User support, anonymized reads'),
     ('analyst', 'Read-only analytics')
 ON CONFLICT (name) DO NOTHING;
+
+
+-- ---------- Seed permissions ----------
+INSERT INTO permissions (code, description) VALUES
+    ('users.read', 'View users'),
+    ('users.suspend', 'Suspend users'),
+    ('users.restore', 'Restore users'),
+    ('users.delete', 'Delete users'),
+
+    ('knowledge.read', 'View knowledge documents'),
+    ('knowledge.upload', 'Upload knowledge documents'),
+    ('knowledge.reindex', 'Reindex knowledge documents'),
+
+    ('safety.read', 'View safety events'),
+    ('safety.resolve', 'Resolve safety events'),
+
+    ('analytics.read', 'View analytics'),
+
+    ('audit.read', 'View audit logs'),
+
+    ('system.read', 'View system information'),
+    ('system.settings', 'Manage system settings')
+ON CONFLICT (code) DO NOTHING;
+
+-- ---------- Role permissions ----------
+
+-- super_admin: all permissions
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r
+CROSS JOIN permissions p
+WHERE r.name = 'super_admin'
+ON CONFLICT DO NOTHING;
+
+-- admin: user, safety, analytics and system read access
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r
+JOIN permissions p
+  ON p.code IN (
+    'users.read',
+    'users.suspend',
+    'users.restore',
+    'users.delete',
+    'knowledge.read',
+    'safety.read',
+    'safety.resolve',
+    'analytics.read',
+    'audit.read',
+    'system.read'
+  )
+WHERE r.name = 'admin'
+ON CONFLICT DO NOTHING;
+
+-- medical_content_manager: knowledge/RAG management
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r
+JOIN permissions p
+  ON p.code IN (
+    'knowledge.read',
+    'knowledge.upload',
+    'knowledge.reindex'
+  )
+WHERE r.name = 'medical_content_manager'
+ON CONFLICT DO NOTHING;
+
+-- support: limited user and safety visibility
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r
+JOIN permissions p
+  ON p.code IN (
+    'users.read',
+    'safety.read'
+  )
+WHERE r.name = 'support'
+ON CONFLICT DO NOTHING;
+
+-- analyst: read-only analytics
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r
+JOIN permissions p
+  ON p.code IN ('analytics.read')
+WHERE r.name = 'analyst'
+ON CONFLICT DO NOTHING;
