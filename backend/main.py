@@ -32,7 +32,7 @@ import uuid
 from collections import defaultdict
 from typing import AsyncGenerator, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -58,7 +58,7 @@ START_TS = time.time()
 # App + CORS
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="MEDAI API", version="1.0.0", docs_url="/docs" if ENVIRONMENT != "production" else None)
+app = FastAPI(title="MEDAI API", version="1.0.0", docs_url="/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -453,9 +453,13 @@ def login(req: AuthRequest, request: Request):
 
 
 @app.post("/api/auth/bootstrap-admin")
-def bootstrap_admin(req: BootstrapAdminRequest, request: Request):
+def bootstrap_admin(
+    req: BootstrapAdminRequest,
+    request: Request,
+    bootstrap_token_header: str = Header(default="", alias="X-Admin-Bootstrap-Token"),
+):
     bootstrap_token = os.getenv("ADMIN_BOOTSTRAP_TOKEN", "")
-    supplied = request.headers.get("X-Admin-Bootstrap-Token", "")
+    supplied = bootstrap_token_header
     if not bootstrap_token or not secrets.compare_digest(supplied, bootstrap_token):
         raise HTTPException(status_code=404, detail="Not found")
     email = normalize_email(req.email)
