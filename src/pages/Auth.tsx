@@ -12,13 +12,31 @@ export default function Auth({ mode }: { mode: "login" | "register" }) {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const isLogin = mode === "login";
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  function submit(e: React.FormEvent) {
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
+    setError("");
+    setLoading(true);
     try {
-      localStorage.setItem("medai_auth", JSON.stringify({ email, name: name || email.split("@")[0], ts: Date.now() }));
-    } catch { /* private mode */ }
-    navigate("/health");
+      const base = ((import.meta.env.VITE_API_URL as string | undefined) || "http://localhost:8000").replace(/\/$/, "");
+      const res = await fetch(`${base}/api/auth/${isLogin ? "login" : "register"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password, ...(isLogin ? {} : { name }) }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || "Authentication failed");
+      localStorage.setItem("medai_token", data.token);
+      localStorage.setItem("medai_user", JSON.stringify(data.user));
+      localStorage.setItem("medai_auth", JSON.stringify({ email: data.user.email, name: data.user.name, role: data.user.role, ts: Date.now() }));
+      navigate(data.user.role === "super_admin" || data.user.role === "admin" ? "/admin" : "/health");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Authentication failed");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -49,8 +67,10 @@ export default function Auth({ mode }: { mode: "login" | "register" }) {
               </div>
             )}
 
-            <MagneticButton type="submit" className="w-full py-3.5">
-              {isLogin ? t("auth.loginBtn") : t("auth.regBtn")}
+            {error && <div role="alert" className="rounded-xl border border-red-400/20 bg-red-400/10 px-3 py-2 text-sm text-red-200">{error}</div>}
+
+            <MagneticButton type="submit" disabled={loading} className="w-full py-3.5">
+              {loading ? "..." : (isLogin ? t("auth.loginBtn") : t("auth.regBtn"))}
               <ArrowUpRight className="h-4 w-4 rtl:-scale-x-100" />
             </MagneticButton>
           </form>
@@ -92,4 +112,3 @@ function Field({ icon: Icon, label, value, onChange, type, autoComplete }: {
       </span>
     </label>
   );
-}
