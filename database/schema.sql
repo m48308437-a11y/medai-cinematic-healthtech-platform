@@ -1,3 +1,31 @@
+-- ==================================================================
+-- MEDAI · PostgreSQL schema (v1)
+-- Health data is sensitive: enable pgcrypto, encrypt at rest,
+-- and restrict direct table access behind the API service role.
+-- ==================================================================
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "citext";
+
+-- ---------- Identity & access ----------
+CREATE TABLE roles (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,            -- super_admin | admin | medical_content_manager | support | analyst | user
+    description TEXT DEFAULT ''
+);
+
+CREATE TABLE permissions (
+    id          SERIAL PRIMARY KEY,
+    code        TEXT NOT NULL UNIQUE,            -- e.g. users.suspend, knowledge.reindex
+    description TEXT DEFAULT ''
+);
+
+CREATE TABLE role_permissions (
+    role_id       INT REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id INT REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+
 CREATE TABLE users (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     email           CITEXT NOT NULL UNIQUE,
@@ -155,7 +183,8 @@ INSERT INTO roles (name, description) VALUES
     ('admin', 'User, safety and system management'),
     ('medical_content_manager', 'Sources, documents and content'),
     ('support', 'User support, anonymized reads'),
-    ('analyst', 'Read-only analytics')
+    ('analyst', 'Read-only analytics'),
+    ('user', 'Standard application user')
 ON CONFLICT (name) DO NOTHING;
 
 
