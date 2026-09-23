@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import secrets
 import time
 import uuid
 from collections import defaultdict
@@ -35,6 +36,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from auth import audit, create_session, db, get_current_user, hash_password, has_permission, normalize_email, revoke_session, verify_password
 
 # ---------------------------------------------------------------------------
 # Configuration (all from environment — no hard-coded secrets)
@@ -233,6 +236,14 @@ class AuthRequest(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
 
 
+
+
+class BootstrapAdminRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=200)
+    password: str = Field(min_length=12, max_length=128)
+    name: str = Field(min_length=2, max_length=120)
+
+
 class SymptomRequest(BaseModel):
     symptoms: list[str] = Field(max_length=12)
     duration: Optional[str] = None
@@ -359,30 +370,168 @@ def medications():
     return {"medications": MEDICATION_DB, "note": "Information only — never a prescription."}
 
 
-_sessions: dict[str, dict] = {}
+def _bearer_token(request: Request) -> str | None:
+    value = request.headers.get("Authorization", "")
+    if value.lower().startswith("bearer "):
+        return value[7:].strip() or None
+    return None
+
+
+def _auth_user(request: Request) -> dict:
+    try:
+        user = get_current_user(_bearer_token(request))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Authentication service unavailable") from exc
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def _admin_user(request: Request, permission: str | None = None) -> dict:
+    user = _auth_user(request)
+    if user.get("role") not in {"super_admin", "admin", "medical_content_manager", "support", "analyst"}:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if permission and not has_permission(user, permission):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    return user
 
 
 @app.post("/api/auth/register")
-def register(req: AuthRequest):
-    token = uuid.uuid4().hex
-    _sessions[token] = {"email": req.email, "name": req.name, "created": time.time()}
-    return {"token": token, "user": _sessions[token], "note": "Demo session — use hashed passwords + DB in production."}
+def register(req: AuthRequest, request: Request):
+    email = normalize_email(req.email)
+    name = (req.name or email.split("@")[0]).strip()
+    password_hash = hash_password(req.password)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM roles WHERE name='user'")
+                role = cur.fetchone()
+                if not role:
+                    raise HTTPException(status_code=500, detail="User role is not configured")
+                cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+                if cur.fetchone():
+                    raise HTTPException(status_code=409, detail="An account with this email already exists")
+                cur.execute(
+                    "INSERT INTO users (email,password_hash,full_name,role_id,status,locale) VALUES (%s,%s,%s,%s,'active','en') RETURNING id,email,full_name,role_id,status,locale",
+                    (email, password_hash, name, role["id"]),
+                )
+                user = cur.fetchone()
+        token, expires = create_session(str(user["id"]), request.client.host if request.client else None, request.headers.get("user-agent"))
+        audit(str(user["id"]), "auth.register", str(user["id"]), ip=request.client.host if request.client else None)
+        return {"token": token, "expiresAt": expires.isoformat(), "user": {"id": str(user["id"]), "email": user["email"], "name": user["full_name"], "role": "user"}}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
 
 @app.post("/api/auth/login")
-def login(req: AuthRequest):
-    token = uuid.uuid4().hex
-    _sessions[token] = {"email": req.email, "created": time.time()}
-    return {"token": token, "user": _sessions[token]}
+def login(req: AuthRequest, request: Request):
+    email = normalize_email(req.email)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.id,u.email,u.full_name,u.password_hash,u.status,u.email_verified,r.name AS role
+                    FROM users u JOIN roles r ON r.id=u.role_id WHERE u.email=%s
+                    """,
+                    (email,),
+                )
+                user = cur.fetchone()
+        if not user or not verify_password(req.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        if user["status"] != "active":
+            raise HTTPException(status_code=403, detail="Account is not active")
+        token, expires = create_session(str(user["id"]), request.client.host if request.client else None, request.headers.get("user-agent"))
+        audit(str(user["id"]), "auth.login", str(user["id"]), ip=request.client.host if request.client else None)
+        return {"token": token, "expiresAt": expires.isoformat(), "user": {"id": str(user["id"]), "email": user["email"], "name": user["full_name"], "role": user["role"], "emailVerified": user["email_verified"]}}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+@app.post("/api/auth/bootstrap-admin")
+def bootstrap_admin(req: BootstrapAdminRequest, request: Request):
+    bootstrap_token = os.getenv("ADMIN_BOOTSTRAP_TOKEN", "")
+    supplied = request.headers.get("X-Admin-Bootstrap-Token", "")
+    if not bootstrap_token or not secrets.compare_digest(supplied, bootstrap_token):
+        raise HTTPException(status_code=404, detail="Not found")
+    email = normalize_email(req.email)
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM roles WHERE name='super_admin'")
+                role = cur.fetchone()
+                if not role:
+                    raise HTTPException(status_code=500, detail="super_admin role is not configured")
+                cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        "UPDATE users SET password_hash=%s, full_name=%s, role_id=%s, status='active', email_verified=TRUE, updated_at=now() WHERE id=%s",
+                        (hash_password(req.password), req.name.strip(), role["id"], existing["id"]),
+                    )
+                    user_id = str(existing["id"])
+                else:
+                    cur.execute(
+                        "INSERT INTO users (email,password_hash,full_name,role_id,status,email_verified,locale) VALUES (%s,%s,%s,%s,'active',TRUE,'en') RETURNING id",
+                        (email, hash_password(req.password), req.name.strip(), role["id"]),
+                    )
+                    user_id = str(cur.fetchone()["id"])
+        audit(user_id, "auth.bootstrap_admin", user_id, ip=request.client.host if request.client else None)
+        return {"ok": True, "message": "Super admin account is ready. Remove ADMIN_BOOTSTRAP_TOKEN from Render now."}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request):
+    token = _bearer_token(request)
+    if token:
+        try:
+            revoke_session(token)
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(request: Request):
+    user = _auth_user(request)
+    return {"id": str(user["id"]), "email": user["email"], "name": user["full_name"], "role": user["role"], "permissions": user.get("permissions") or [], "status": user["status"]}
 
 
 @app.get("/api/admin/stats")
-def admin_stats():
-    return {
-        "users": 48210, "activeNow": 3124, "aiRequests24h": 96400,
-        "consultations": 12840, "safetyEvents": 6, "uptime": "99.98%",
-        "provider": get_provider().name, "model": AI_MODEL,
-    }
+def admin_stats(request: Request):
+    user = _admin_user(request, "analytics.read")
+    try:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM users WHERE status <> 'deleted'")
+                users = cur.fetchone()["n"]
+                cur.execute("SELECT COUNT(*) AS n FROM consultations")
+                consultations = cur.fetchone()["n"]
+                cur.execute("SELECT COUNT(*) AS n FROM safety_events WHERE resolved=false")
+                safety_events = cur.fetchone()["n"]
+                cur.execute("SELECT COUNT(*) AS n FROM messages WHERE created_at >= now() - interval '24 hours'")
+                ai_requests_24h = cur.fetchone()["n"]
+        return {
+            "users": users,
+            "activeNow": None,
+            "aiRequests24h": ai_requests_24h,
+            "consultations": consultations,
+            "safetyEvents": safety_events,
+            "uptime": None,
+            "provider": get_provider().name,
+            "model": AI_MODEL,
+            "admin": {"id": str(user["id"]), "name": user["full_name"], "role": user["role"]},
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Admin database unavailable") from exc
 
 
 # ---------------------------------------------------------------------------
